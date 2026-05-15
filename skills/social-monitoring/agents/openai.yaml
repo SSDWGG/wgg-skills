@@ -1,0 +1,4 @@
+interface:
+  display_name: "Social Monitoring"
+  short_description: "Monitor public social posts and events."
+  default_prompt: "Use $social-monitoring to track a public figure across X, Instagram, Facebook, and web sources and produce a daily digest."

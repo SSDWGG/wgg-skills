@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes Weixin Gateway"
+  short_description: "Connect Hermes to Weixin IM"
+  default_prompt: "Use $hermes-weixin-gateway to connect Hermes to Weixin and verify replies."

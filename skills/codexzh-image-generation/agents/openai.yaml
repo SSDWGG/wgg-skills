@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodexZH Image Generation"
+  short_description: "Generate and download images through CodexZH AI Hub image APIs."
+  default_prompt: "Generate an image with CodexZH AI Hub and save it locally."

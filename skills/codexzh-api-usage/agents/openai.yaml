@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodexZH Usage"
+  short_description: "一键查询 CodexZH API 用量、剩余额度、订阅与消费明细"
+  default_prompt: "Use $codexzh-api-usage to query the current CodexZH API usage, remaining quota, spend, and subscription status."

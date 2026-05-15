@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodexZH Token Email Reminder"
+  short_description: "Manage scheduled CodexZH usage emails."
+  default_prompt: "Use $codexzh-token-email-reminder to start, stop, or update the CodexZH token usage email reminder."

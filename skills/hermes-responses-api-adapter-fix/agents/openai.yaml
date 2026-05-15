@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes Responses API 适配修复"
+  short_description: "Fix Hermes GPT routes to Responses API."
+  default_prompt: "Use $hermes-responses-api-adapter-fix to diagnose and fix Hermes GPT-family custom provider routing so it uses codex_responses / OpenAI Responses API."
