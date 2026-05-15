@@ -1,0 +1,7 @@
+.DS_Store
+*.log
+*.jsonl
+.env
+.env.*
+secrets/
+credentials/
