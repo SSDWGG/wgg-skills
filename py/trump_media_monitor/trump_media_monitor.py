@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_shared"))
 from net_fetch import fetch_url as resilient_fetch_url
+from tweet_fetcher import fetch_tweets
 
 
 HOME = Path.home()
@@ -39,6 +40,7 @@ SEND_EMAIL_SCRIPT = Path(
 ).expanduser()
 EMAIL_ACCOUNT = os.environ.get("TRUMP_MONITOR_EMAIL_ACCOUNT", "1982549567@qq.com")
 EMAIL_TO = os.environ.get("TRUMP_MONITOR_EMAIL_TO", EMAIL_ACCOUNT)
+FETCH_PROXY = os.environ.get("TRUMP_MONITOR_PROXY") or os.environ.get("MONITOR_PROXY") or ""
 
 
 def parse_args():
@@ -237,7 +239,24 @@ def google_news_url(query, lookback_hours):
 
 
 def fetch_url(url):
-    return resilient_fetch_url(url, user_agent="Codex social-monitoring personal RSS reader/1.0")
+    return resilient_fetch_url(url, user_agent="Codex social-monitoring personal RSS reader/1.0", proxy=FETCH_PROXY or None)
+
+
+def extract_rss_description(item):
+    desc = clean_text(item.findtext("description", ""))
+    if not desc:
+        return ""
+    desc = re.sub(r"<(a|img)[^>]*>.*?</\1>", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"<br\s*/?>", "\n", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"</?(p|div|li|ol|ul|span|b|i|em|strong|font)[^>]*>", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"<[^>]+>", " ", desc)
+    desc = re.sub(r"&nbsp;", " ", desc)
+    desc = re.sub(r"\n{3,}", "\n\n", desc)
+    desc = re.sub(r" +", " ", desc)
+    desc = re.sub(r"\n +", "\n", desc)
+    lines = [line.strip() for line in desc.split("\n")]
+    desc = "\n".join(line for line in lines if line)
+    return desc.strip()
 
 
 def parse_rss(xml_bytes, retrieval_method):
@@ -251,6 +270,7 @@ def parse_rss(xml_bytes, retrieval_method):
         link = clean_text(item.findtext("link", ""))
         guid = clean_text(item.findtext("guid", ""))
         pub_raw = clean_text(item.findtext("pubDate", ""))
+        description = extract_rss_description(item)
         try:
             published = email.utils.parsedate_to_datetime(pub_raw)
             if published.tzinfo is None:
@@ -260,6 +280,7 @@ def parse_rss(xml_bytes, retrieval_method):
         if not title or not link:
             continue
         brief = chinese_brief(title, source)
+        text_excerpt = description if description else title
         records.append(
             {
                 "target": "donald-trump",
@@ -273,7 +294,7 @@ def parse_rss(xml_bytes, retrieval_method):
                 "published_display": published.astimezone(TZ).strftime("%Y-%m-%d %H:%M") if published else "",
                 "observed_at": datetime.now(TZ).isoformat(timespec="seconds"),
                 "source": source or "Unknown source",
-                "text_excerpt": title,
+                "text_excerpt": text_excerpt,
                 "summary": title,
                 "topic_label": brief["topic_label"],
                 "chinese_description": brief["chinese_description"],
@@ -315,7 +336,38 @@ def collect_records(lookback_hours):
     return sorted(deduped.values(), key=lambda item: item.get("published_at", ""), reverse=True), errors
 
 
-def build_markdown(now, records, new_records, errors, report_path):
+def collect_tweets():
+    """Fetch recent tweets from @realDonaldTrump via Nitter RSS."""
+    try:
+        tweets = fetch_tweets("realDonaldTrump", proxy=FETCH_PROXY or None)
+    except Exception as exc:
+        return [], [f"tweets: {exc}"]
+    for t in tweets:
+        t["target"] = "donald-trump"
+        t["topic_label"] = "推文 / 转发" if t["is_retweet"] else "推文 / 原创"
+        t["impact_level"] = "中"
+        t["chinese_description"] = _tweet_chinese_brief(t)
+        t["impact"] = (
+            "特朗普在社交平台上的直接发声，常常快速改变媒体议程并影响支持者动员、"
+            "对手回应和短期舆论走向。"
+        )
+        t["source"] = f"X/Twitter · {t['original_author']}"
+        t["tags"] = ["social-platform"]
+        t["confidence"] = "high"
+    return tweets, []
+
+
+def _tweet_chinese_brief(tweet):
+    prefix = "转发" if tweet["is_retweet"] else "发推"
+    text = tweet["summary"]
+    if len(text) > 200:
+        text = text[:197] + "..."
+    return f"特朗普在 X/Twitter {prefix}：「{text}」"
+
+
+def build_markdown(now, records, new_records, errors, report_path, tweets=None, new_tweets=None):
+    tweets = tweets or []
+    new_tweets = new_tweets or []
     start = now - timedelta(hours=24)
     lines = [
         f"**Window:** {start.strftime('%Y-%m-%d %H:%M')}-{now.strftime('%Y-%m-%d %H:%M')} Asia/Shanghai",
@@ -324,10 +376,10 @@ def build_markdown(now, records, new_records, errors, report_path):
         "",
         "**中文摘要**",
     ]
-    highlights = new_records[:5] or records[:5]
+    highlights = new_tweets[:3] + (new_records[:3] or records[:3])
     if highlights:
-        for item in highlights:
-            label = "新增" if item in new_records else "已收录"
+        for item in highlights[:6]:
+            label = "新增" if (item in new_records or item in new_tweets) else "已收录"
             lines.append(
                 f"- [{label}] {item['topic_label']}：{item['chinese_description']} "
                 f"可能影响：{item['impact']}"
@@ -335,28 +387,42 @@ def build_markdown(now, records, new_records, errors, report_path):
     else:
         lines.append("- 本轮没有抓取到新的公开网页/新闻候选项。")
 
-    lines.extend(
-        [
+    # Tweet section
+    if tweets:
+        lines.extend(["", "**🪽 X/Twitter 推文原文**", ""])
+        for index, item in enumerate(tweets[:15], start=1):
+            rt_label = " [转发]" if item.get("is_retweet") else ""
+            lines.extend([
+                f"### 推文 {index}.{rt_label}",
+                f"- **时间：** {item['published_display'] or '-'} · @{item.get('original_author', '')}",
+                f"- **原文 (English)：**",
+                f"  > {item['text_excerpt']}",
+                f"- **中文摘要：** {item['chinese_description']}",
+                f"- **链接：** {item['content_url']}",
+                "",
+            ])
+    else:
+        lines.extend([
             "",
-            "**直接发帖监控**",
-            "| 时间 | 平台 | 账号 | 说明 | 链接 |",
-            "|---|---|---|---|---|",
-            "| - | Truth Social | @realDonaldTrump | 尚未配置官方或授权访问方式，因此不抓取或绕过登录、反爬和隐私控制；当前只做公开网页/新闻来源监控。 | https://truthsocial.com/@realDonaldTrump |",
-            "| - | X/Twitter | @realDonaldTrump | 尚未配置官方 X API 凭据，因此不抓取或绕过登录页；当前只做公开网页/新闻来源监控。 | https://x.com/realDonaldTrump |",
+            "**🪽 X/Twitter 推文原文**",
+            "- 本轮未获取到推文（Nitter 源可能受限或账号暂无新推文）。",
             "",
-            "**相关媒体动态**",
-        ]
-    )
+        ])
+
+    lines.extend(["**相关媒体动态**", ""])
     for index, item in enumerate((new_records or records)[:12], start=1):
+        excerpt = item.get("text_excerpt", item["summary"])
         lines.extend(
             [
-                "",
                 f"### {index}. {item['topic_label']}（影响：{item['impact_level']}）",
                 f"- **时间/来源：** {item['published_display'] or '-'} · {item['source']}",
-                f"- **中文说明：** {item['chinese_description']}",
+                f"- **标题：** {item['summary']}",
+                f"- **原文内容 (English)：**",
+                f"  > {excerpt}",
+                f"- **中文分析：** {item['chinese_description']}",
                 f"- **可能影响：** {item['impact']}",
-                f"- **原始标题：** {item['summary']}",
                 f"- **链接：** {item['content_url']}",
+                "",
             ]
         )
 
@@ -375,10 +441,35 @@ def build_markdown(now, records, new_records, errors, report_path):
     return "\n".join(lines) + "\n"
 
 
-def build_html_body(now, records, new_records, report_path, errors):
-    selected = new_records[:8] or records[:8]
+def build_html_body(now, records, new_records, report_path, errors, tweets=None, new_tweets=None):
+    tweets = tweets or []
+    new_tweets = new_tweets or []
+    selected = new_records[:6] or records[:6]
+
+    # Tweet cards first (blue style)
+    tweet_cards = []
+    for item in tweets[:8]:
+        rt_badge = ' <span style="display:inline-block;background:#fef3c7;color:#92400e;border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700;margin-left:4px;">转发</span>' if item.get("is_retweet") else ""
+        tweet_cards.append(
+            "<div style='border:1px solid #bae6fd;border-radius:10px;padding:14px 16px;margin:12px 0;background:#f0f9ff;'>"
+            "<div style='font-size:13px;line-height:20px;color:#0369a1;'>"
+            f"🪽 {html.escape(item['published_display'] or '-')} · @{html.escape(item.get('original_author', ''))}{rt_badge}"
+            "</div>"
+            "<div style='margin-top:10px;background:#ffffff;border-radius:8px;padding:12px 14px;'>"
+            "<div style='font-size:12px;color:#6b7280;font-weight:700;margin-bottom:6px;'>ENGLISH (原文)</div>"
+            f"<div style='font-size:15px;line-height:24px;color:#111827;white-space:pre-wrap;'>{html.escape(item['text_excerpt'])}</div>"
+            "</div>"
+            f"<p style='font-size:14px;line-height:22px;color:#075985;margin:10px 0 0 0;'><strong>中文：</strong>{html.escape(item['chinese_description'])}</p>"
+            f"<div style='margin-top:8px;font-size:13px;line-height:20px;'><a href='{html.escape(item['content_url'])}' style='color:#0284c7;'>查看原推</a></div>"
+            "</div>"
+        )
+    if not tweet_cards:
+        tweet_cards.append("<div style='padding:12px;color:#6b7280;font-size:13px;'>本轮未获取到推文（Nitter 源可能受限或账号暂无新推文）。</div>")
+
+    # News cards
     cards = []
     for item in selected:
+        excerpt = item.get("text_excerpt", item["summary"])
         level_color = "#dc2626" if item["impact_level"] == "高" else "#b45309" if item["impact_level"] == "中" else "#4b5563"
         cards.append(
             "<div style='border:1px solid #e5e7eb;border-radius:10px;padding:14px 16px;margin:12px 0;background:#ffffff;'>"
@@ -389,11 +480,13 @@ def build_html_body(now, records, new_records, report_path, errors):
             f"<span style='display:inline-block;background:#eef2ff;color:#3730a3;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:700;'>{html.escape(item['topic_label'])}</span>"
             f"<span style='display:inline-block;margin-left:6px;color:{level_color};font-size:12px;font-weight:700;'>影响：{html.escape(item['impact_level'])}</span>"
             "</div>"
-            f"<p style='font-size:15px;line-height:24px;color:#111827;margin:10px 0 0 0;'><strong>中文说明：</strong>{html.escape(item['chinese_description'])}</p>"
-            f"<p style='font-size:15px;line-height:24px;color:#374151;margin:8px 0 0 0;'><strong>可能影响：</strong>{html.escape(item['impact'])}</p>"
-            "<div style='margin-top:10px;font-size:13px;line-height:20px;color:#6b7280;'>"
-            f"原始标题：{html.escape(item['summary'])}"
+            f"<p style='font-size:15px;line-height:24px;color:#111827;margin:10px 0 0 0;'><strong>标题：</strong>{html.escape(item['summary'])}</p>"
+            "<div style='margin-top:10px;background:#f0f9ff;border-left:3px solid #0ea5e9;padding:10px 14px;border-radius:4px;'>"
+            "<div style='font-size:12px;color:#0369a1;font-weight:700;margin-bottom:4px;'>ENGLISH (原文)</div>"
+            f"<div style='font-size:14px;line-height:22px;color:#0c4a6e;white-space:pre-wrap;'>{html.escape(excerpt)}</div>"
             "</div>"
+            f"<p style='font-size:15px;line-height:24px;color:#111827;margin:10px 0 0 0;'><strong>中文分析：</strong>{html.escape(item['chinese_description'])}</p>"
+            f"<p style='font-size:15px;line-height:24px;color:#374151;margin:8px 0 0 0;'><strong>可能影响：</strong>{html.escape(item['impact'])}</p>"
             f"<div style='margin-top:8px;font-size:13px;line-height:20px;'><a href='{html.escape(item['content_url'])}' style='color:#2563eb;'>查看来源</a></div>"
             "</div>"
         )
@@ -401,7 +494,7 @@ def build_html_body(now, records, new_records, report_path, errors):
         cards.append("<div style='padding:12px;color:#374151;'>本轮没有抓取到公开网页/新闻候选项。</div>")
     error_note = ""
     if errors:
-        error_note = f"<p style='color:#b45309;'>来源错误：{html.escape('; '.join(errors))}</p>"
+        error_note = f"<p style='color:#b45309;'>错误：{html.escape('; '.join(errors))}</p>"
     return f"""<!doctype html>
 <html>
   <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,'PingFang SC','Microsoft YaHei',sans-serif;color:#111827;background:#f3f4f6;margin:0;padding:24px;">
@@ -409,13 +502,16 @@ def build_html_body(now, records, new_records, report_path, errors):
       <div style="background:#111827;border-radius:14px 14px 0 0;padding:22px 24px;">
         <div style="font-size:13px;color:#9ca3af;">Social Monitoring</div>
         <h1 style="font-size:25px;line-height:34px;margin:6px 0 8px 0;color:#ffffff;">特朗普公开媒体动态简报</h1>
-        <p style="color:#d1d5db;margin:0;">{now.strftime('%Y-%m-%d %H:%M:%S')} Asia/Shanghai · 新增 {len(new_records)} 条 · 候选 {len(records)} 条</p>
+        <p style="color:#d1d5db;margin:0;">{now.strftime('%Y-%m-%d %H:%M:%S')} Asia/Shanghai · 推文 {len(tweets)} 条 · 新闻新增 {len(new_records)} 条 · 候选 {len(records)} 条</p>
       </div>
       <div style="background:#f9fafb;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 14px 14px;padding:18px 20px;">
-        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px 0;">下面每条都包含中文说明和可能影响。Markdown 完整报告已作为附件发送：<code>{html.escape(str(report_path))}</code></p>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px 0;">Markdown 完整报告已作为附件发送：<code>{html.escape(str(report_path))}</code></p>
+        <h2 style="font-size:18px;color:#0369a1;margin:20px 0 10px 0;">🪽 X/Twitter 推文原文</h2>
+        {''.join(tweet_cards)}
+        <h2 style="font-size:18px;color:#111827;margin:24px 0 10px 0;">📰 相关媒体报道</h2>
         {''.join(cards)}
         <div style="border-top:1px solid #e5e7eb;margin-top:16px;padding-top:12px;color:#6b7280;font-size:13px;line-height:20px;">
-          Truth Social 和 X/Twitter 直接发帖监控尚未启用，因为当前没有配置官方或授权 API 凭据；本任务不会绕过登录、隐私或反爬限制。
+          Truth Social 直接发帖监控尚未启用。X/Twitter 推文通过 Nitter RSS 公开源获取。
         </div>
       {error_note}
       </div>
@@ -458,31 +554,40 @@ def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     TEXT_LOG.parent.mkdir(parents=True, exist_ok=True)
 
-    records, errors = collect_records(args.lookback_hours)
+    records, news_errors = collect_records(args.lookback_hours)
     records = records[: max(args.max_items, 1)]
+    tweets, tweet_errors = collect_tweets()
+    errors = news_errors + tweet_errors
+
     seen = load_seen()
     new_records = [item for item in records if item["dedupe_key"] not in seen]
+    new_tweets = [item for item in tweets if item["dedupe_key"] not in seen]
 
     report_path = REPORT_DIR / f"trump-media-{now.strftime('%Y%m%d-%H%M%S')}.md"
-    markdown = build_markdown(now, records, new_records, errors, report_path)
+    markdown = build_markdown(now, records, new_records, errors, report_path, tweets, new_tweets)
     report_path.write_text(markdown, encoding="utf-8")
 
     email_sent = False
     email_result = ""
     try:
-        if not args.dry_run and (new_records or args.force_email or not seen):
-            subject = f"特朗普媒体动态简报 · 新增 {len(new_records)} 条 · {now.strftime('%Y-%m-%d %H:%M')}"
-            email_result = send_email(subject, build_html_body(now, records, new_records, report_path, errors), report_path)
+        if not args.dry_run and (new_records or new_tweets or args.force_email or not seen):
+            total_new = len(new_tweets) + len(new_records)
+            subject = f"特朗普媒体动态简报 · 推文 {len(new_tweets)} 条 · 新闻 {len(new_records)} 条 · {now.strftime('%Y-%m-%d %H:%M')}"
+            html_body = build_html_body(now, records, new_records, report_path, errors, tweets, new_tweets)
+            email_result = send_email(subject, html_body, report_path)
             email_sent = True
     finally:
         if not args.dry_run:
             seen.update(item["dedupe_key"] for item in records)
+            seen.update(item["dedupe_key"] for item in tweets)
             save_seen(seen)
 
     run_record = {
         "timestamp": now.isoformat(timespec="seconds"),
         "records": len(records),
         "newRecords": len(new_records),
+        "tweets": len(tweets),
+        "newTweets": len(new_tweets),
         "emailSent": email_sent,
         "emailResult": email_result,
         "reportPath": str(report_path),
@@ -492,7 +597,7 @@ def main():
     append_text(RUN_LOG, json.dumps(run_record, ensure_ascii=False, separators=(",", ":")))
     append_text(
         TEXT_LOG,
-        f"[{run_record['timestamp']}] records={len(records)} new={len(new_records)} emailSent={email_sent} report={report_path}",
+        f"[{run_record['timestamp']}] records={len(records)} new={len(new_records)} tweets={len(tweets)} newTweets={len(new_tweets)} emailSent={email_sent} report={report_path}",
     )
     print(json.dumps(run_record, ensure_ascii=False, indent=2))
     return 0

@@ -81,7 +81,7 @@ def _try_gg(args):
     raise RuntimeError("; ".join(errors))
 
 
-def fetch_url(url, user_agent=DEFAULT_UA, timeout=30):
+def fetch_url(url, user_agent=DEFAULT_UA, timeout=30, proxy=None):
     errors = []
     curl = shutil.which("curl")
     if curl:
@@ -91,22 +91,22 @@ def fetch_url(url, user_agent=DEFAULT_UA, timeout=30):
         except Exception as exc:
             errors.append(f"direct curl: {exc}")
 
-        proxy = system_proxy_url()
-        if proxy:
+        effective_proxy = proxy or system_proxy_url()
+        if effective_proxy:
             try:
-                return _run_command(_curl_args(url, user_agent, proxy))
+                return _run_command(_curl_args(url, user_agent, effective_proxy))
             except Exception as exc:
-                errors.append(f"system proxy {proxy}: {exc}")
+                errors.append(f"proxy {effective_proxy}: {exc}")
 
         try:
             return _try_gg(args)
         except Exception as exc:
             errors.append(f"gg proxy: {exc}")
 
-    proxy = system_proxy_url()
+    effective_proxy = proxy or system_proxy_url()
     handlers = []
-    if proxy:
-        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    if effective_proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": effective_proxy, "https": effective_proxy}))
     opener = urllib.request.build_opener(*handlers)
     request = urllib.request.Request(url, headers={"User-Agent": user_agent})
     try:
